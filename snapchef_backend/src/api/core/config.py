@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from urllib.parse import urlparse, urlunparse
 
 
 def _get_env(name: str, default: str | None = None) -> str | None:
@@ -60,9 +61,26 @@ def get_settings() -> Settings:
     )
 
 
+def _to_asyncpg_sqlalchemy_scheme(url: str) -> str:
+    """Convert postgres/postgresql scheme to SQLAlchemy asyncpg scheme."""
+    url = url.replace("postgres://", "postgresql://")
+    if url.startswith("postgresql+asyncpg://"):
+        return url
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    # Fallback: if user provided something odd, still try to prepend.
+    return f"postgresql+asyncpg://{url}"
+
+
 # PUBLIC_INTERFACE
 def build_postgres_dsn(settings: Settings) -> str:
     """Build a SQLAlchemy async DSN for Postgres.
+
+    Integration note:
+        Some environments provide a POSTGRES_URL without credentials (e.g. "postgresql://host:port/db")
+        but also provide POSTGRES_USER/POSTGRES_PASSWORD. asyncpg will otherwise fall back to the OS user
+        (often "kavia"), causing "role does not exist". This function merges credentials/db/port from the
+        individual env vars into POSTGRES_URL when missing.
 
     Prefers POSTGRES_URL if provided (expected format: postgresql://... or postgres://...).
     Otherwise, builds a DSN from POSTGRES_USER/PASSWORD/DB/PORT.
@@ -71,14 +89,54 @@ def build_postgres_dsn(settings: Settings) -> str:
         str: SQLAlchemy DSN using the asyncpg driver.
     """
     if settings.postgres_url:
-        # Normalize scheme and force asyncpg driver for SQLAlchemy.
-        url = settings.postgres_url.replace("postgres://", "postgresql://")
-        if url.startswith("postgresql+asyncpg://"):
-            return url
-        if url.startswith("postgresql://"):
-            return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-        # Fallback: if user provided something odd, still try to prepend.
-        return f"postgresql+asyncpg://{url}"
+        # Normalize scheme first.
+        raw = settings.postgres_url.replace("postgres://", "postgresql://")
+
+        # Try to parse and enrich with credentials if missing.
+        try:
+            parsed = urlparse(raw)
+            # Only attempt to enrich standard postgres URLs.
+            if parsed.scheme in ("postgresql", "postgresql+asyncpg"):
+                username = parsed.username or (settings.postgres_user or None)
+                password = parsed.password or (settings.postgres_password or None)
+
+                # If db isn't specified in the URL, use env var (if any).
+                db_from_url = (parsed.path or "").lstrip("/") or None
+                db = db_from_url or (settings.postgres_db or None)
+
+                # If port isn't specified in the URL, use env var (if any).
+                port = parsed.port or (int(settings.postgres_port) if (settings.postgres_port or "").isdigit() else None)
+
+                hostname = parsed.hostname or "localhost"
+
+                netloc = hostname
+                if port is not None:
+                    netloc = f"{netloc}:{port}"
+
+                if username:
+                    userinfo = username
+                    if password:
+                        userinfo = f"{userinfo}:{password}"
+                    netloc = f"{userinfo}@{netloc}"
+
+                path = f"/{db}" if db else (parsed.path or "")
+
+                enriched = urlunparse(
+                    (
+                        "postgresql",  # use base scheme; we'll convert to +asyncpg below
+                        netloc,
+                        path,
+                        parsed.params,
+                        parsed.query,
+                        parsed.fragment,
+                    )
+                )
+                return _to_asyncpg_sqlalchemy_scheme(enriched)
+        except Exception:
+            # If parsing fails, fall back to simple scheme conversion.
+            pass
+
+        return _to_asyncpg_sqlalchemy_scheme(raw)
 
     user = settings.postgres_user or "postgres"
     password = settings.postgres_password or ""
